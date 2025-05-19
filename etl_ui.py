@@ -17,7 +17,6 @@ import re
 from unidecode import unidecode
 import pandas as pd
 import numpy as np
-import openpyxl
 
 # Page Setup
 st.set_page_config(page_title="ETL FEFAL", layout="wide")
