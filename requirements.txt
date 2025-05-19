@@ -1,0 +1,10 @@
+altair
+pandas
+numpy
+unidecode
+streamlit
+psycopg2-binary
+streamlit_tags
+pymongo
+datetime
+sqlalchemy
