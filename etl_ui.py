@@ -67,11 +67,16 @@ def run_etl(year: int, df: pd.DataFrame, mongo_db, cur_sii) -> tuple[dict[str, p
     configs = load_mongo_configs(mongo_db, year)
     group_dfs = split_column_groups(df, configs["groups"])
 
+    print("\n=== GRUPOS DETETADOS ===")
+    for nome, grupo in group_dfs.items():
+        print(f"Grupo '{nome}' → {grupo.shape[1]} colunas:")
+        print(f"Colunas: {list(grupo.columns)}\n")
+
+
     # Rname Cols
     for name, df in group_dfs.items():
         df.columns = [normalize_text(col).strip() for col in df.columns]
-        group_dfs[name] = rename_cols(df, configs["map_ren_col"], strict=(name == "identificacao"))
-
+        group_dfs[name] = rename_cols(df, configs["map_ren_col"], True)
 
     # Process identification
     df_id = group_dfs["identificacao"]  
@@ -176,112 +181,116 @@ def process_completion_percentage(group_dfs):
     df = group_dfs["identificacao"]
     if "percentagem_preenchido" in df.columns:
         df["percentagem_preenchido"] = pd.to_numeric(df["percentagem_preenchido"], errors="coerce")
-        df.loc[df["percentagem_preenchido"] < 0, "percentagem_preenchido"] = pd.NA
-        max_pct = df["percentagem_preenchido"].max(skipna=True)
+        df["percentagem_preenchido"] = df["percentagem_preenchido"].apply(
+            lambda x: x if pd.notna(x) and x >= 0 else np.nan
+        )
+        max_pct = df["percentagem_preenchido"].max()
         if pd.notna(max_pct) and max_pct > 0:
-            df["percentagem_preenchido"] = ((df["percentagem_preenchido"] / max_pct) * 100).round().astype("Int64")
+            df["percentagem_preenchido"] = (df["percentagem_preenchido"] / max_pct * 100).round().astype("Int64")
     else:
         df["percentagem_preenchido"] = pd.NA
     group_dfs["identificacao"] = df
     return group_dfs
 def initialize_time_fields(group_dfs):
     df = group_dfs["identificacao"]
-    if {"data_inicio", "data_fim"}.issubset(df.columns):
+    if "data_inicio" in df.columns and "data_fim" in df.columns:
         df["data_inicio"] = pd.to_datetime(df["data_inicio"], errors="coerce")
         df["data_fim"] = pd.to_datetime(df["data_fim"], errors="coerce")
-        df["tempo_realizacao"] = (df["data_fim"] - df["data_inicio"]).dt.total_seconds()
-        df.loc[df["tempo_realizacao"] <= 0, "tempo_realizacao"] = pd.NA
-        df["tempo_realizacao"] = df["tempo_realizacao"].astype("Int64")
-    else:
-        df["tempo_realizacao"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+        valid_mask = df["data_inicio"].notna() & df["data_fim"].notna()
+        df["tempo_realizacao"] = pd.NA
+        df.loc[valid_mask, "tempo_realizacao"] = (df.loc[valid_mask, "data_fim"] - df.loc[valid_mask, "data_inicio"]).dt.total_seconds()
+        df["tempo_realizacao"] = df["tempo_realizacao"].apply(lambda x: x if pd.notna(x) and x > 0 else pd.NA).astype("Int64")
+    elif "tempo_realizacao" not in df.columns:
+        df["tempo_realizacao"] = pd.Series(dtype="Int64")
     group_dfs["identificacao"] = df
     return group_dfs
 def remove_entity_duplicates(group_dfs):
     df = group_dfs["identificacao"].copy()
-    df["_pct"] = df["percentagem_preenchido"].fillna(-1)
-    df["_tempo"] = df["tempo_realizacao"].fillna(-1)
-    df.sort_values(["id_entidade", "_pct", "_tempo"], ascending=[True, False, False], inplace=True)
-    keep_mask = ~df.duplicated("id_entidade", keep="first")
-    valid_idxs = df[keep_mask].index
-
+    df["__pct"] = df["percentagem_preenchido"].fillna(-1)
+    df["__tempo"] = df["tempo_realizacao"].fillna(-1)
+    df.sort_values(by=["id_entidade", "__pct", "__tempo"], ascending=[True, True, True], inplace=True)
+    dup_mask = df.duplicated(subset="id_entidade", keep="first")    
+    valid_idxs = df[~dup_mask].index
+    duplicate_df = df[dup_mask].drop(columns=["__pct", "__tempo"]).reset_index(drop=True)
     for group in group_dfs:
         group_dfs[group] = group_dfs[group].loc[valid_idxs].reset_index(drop=True)
-
-    duplicate_df = df[~keep_mask].drop(columns=["_pct", "_tempo"]).reset_index(drop=True)
     return group_dfs, duplicate_df
 def process_additional_fields(group_dfs, year):
     df = group_dfs["identificacao"]
     df["ano"] = year
     if "nome_responsavel" not in df.columns:
         df["nome_responsavel"] = pd.NA
-    df["data_submissao"] = pd.to_datetime(df.get("data_submissao", pd.NaT), errors="coerce")
-    if "data_fim" in df.columns:
+    if "data_submissao" in df.columns and "data_fim" in df.columns:
+        df["data_submissao"] = pd.to_datetime(df["data_submissao"], errors="coerce")
         df["data_fim"] = pd.to_datetime(df["data_fim"], errors="coerce")
         df["data_submissao"] = df["data_submissao"].fillna(df["data_fim"])
-    group_dfs["identificacao"] = df
+    else:
+        df["data_submissao"] = pd.NaT
+    # group_dfs["identificacao"] = df[["id_entidade", "ano", "data_submissao", "existe_responsavel", "nome_responsavel", "percentagem_preenchido", "tempo_realizacao"]]
     return group_dfs
 def process_formations(group_dfs):
     if "formacoes" not in group_dfs or group_dfs["formacoes"].empty:
         return group_dfs
-
-    def clean_column_names(text):
-        return str(text).strip() if pd.notna(text) else ""
-
+    
+    def clean_column_names(text, invalids):
+        if pd.isna(text):
+            return ""
+        for inval in invalids:
+            if inval:
+                text = str(text).replace(str(inval), "")
+        return text.strip()
     def validate_numeric(v):
         try:
-            num = int(float(v))
-            return max(num, 0)
+            num = int(v)
+            return num if num >= 0 else 0
         except:
             return 0
-
-    df = group_dfs["formacoes"]
-    df.columns = [clean_column_names(col) for col in df.columns]
-    for col in df.columns:
-        df[col] = df[col].apply(validate_numeric).astype("Int64")
-    group_dfs["formacoes"] = df
+    group_dfs["formacoes"].columns = [clean_column_names(col, prefixes) for col in group_dfs["formacoes"].columns]
+    for col in group_dfs["formacoes"].columns:
+        group_dfs["formacoes"][col] = group_dfs["formacoes"][col].apply(validate_numeric)
     return group_dfs
 def process_interests(group_dfs, interests_keys):
     if "interesses" not in group_dfs or group_dfs["interesses"].empty:
         return group_dfs
-
     comment_keys = [normalize_text(k) for k in interests_keys.get("comment_keys", [])]
-
-    def map_interest(val):
-        v = normalize_text(str(val))
-        if v == "sim": return 1
-        if v == "nao": return 0
-        return pd.NA
-
-    df = group_dfs["interesses"]
-    for col in df.columns:
-        if all(kw not in normalize_text(col) for kw in comment_keys):
-            df[col] = df[col].apply(map_interest).astype("Int64")
-
-    group_dfs["interesses"] = df
+    for col in group_dfs["interesses"].columns:
+        col_normalized = normalize_text(col)
+        if all(kw not in col_normalized for kw in comment_keys):
+            group_dfs["interesses"][col] = group_dfs["interesses"][col].apply(
+                lambda v: 1 if (nv := normalize_text(str(v))) == "sim"
+                else 0 if nv == "nao" else None
+            )
     return group_dfs
 def process_availability(group_dfs):
     if "disponibilidade" not in group_dfs or group_dfs["disponibilidade"].empty:
         return group_dfs
-
-    def map_disp(val):
-        v = normalize_text(str(val))
-        if v == "sim": return 1
-        if v == "nao": return 0
-        return pd.NA
-
-    df = group_dfs["disponibilidade"]
-    for col in df.columns:
-        df[col] = df[col].apply(map_disp).astype("Int64")
-
-    group_dfs["disponibilidade"] = df
+    for col in group_dfs["disponibilidade"].columns:
+        group_dfs["disponibilidade"][col] = group_dfs["disponibilidade"][col].apply(
+            lambda v: 1 if (nv := normalize_text(str(v))) == "sim"
+            else 0 if nv == "nao" else None
+        )
     return group_dfs
 def validate_preferences(group_dfs):
+    # Verificar se existe e é um DataFrame
+    if "tipo de ensino" not in group_dfs or group_dfs["tipo de ensino"].empty:
+        return group_dfs
     df = group_dfs.get("tipo de ensino")
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+    if df is None:
+        print("[validate_preferences] ⚠️ Grupo 'tipo de ensino' não encontrado.")
+        return group_dfs
+    if not isinstance(df, pd.DataFrame):
+        print("[validate_preferences] ⚠️ 'tipo de ensino' não é um DataFrame.")
+        return group_dfs
+    if df.empty:
+        print("[validate_preferences] ⚠️ DataFrame 'tipo de ensino' está vazio.")
         return group_dfs
 
+    # Aplicar conversão robusta para cada coluna
     for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors='coerce').astype("Int64")
+        try:
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype("Int64")
+        except Exception as e:
+            print(f"[validate_preferences] ⚠️ Erro ao converter coluna '{col}': {e}")
 
     group_dfs["tipo de ensino"] = df
     return group_dfs
@@ -296,16 +305,6 @@ def numeric_input(label, value=0, min_value=0, key=None):
         return num
     except ValueError:
         return min_value
-def normalize_text(texto):
-    if not isinstance(texto, str) or not texto.strip():  
-        return ""  
-    
-    texto = texto.strip()                # Remover espaços no início e no fim
-    texto = unidecode(texto)             # Remover acentos
-    texto = re.sub(r"\s+", " ", texto)   # Substituir múltiplos espaços por um único espaço
-    texto = texto.lower()                # Converter para minusculas
-    
-    return texto
 def connect_sii():
     try:
         conn = psycopg2.connect(
@@ -346,15 +345,12 @@ def move_group(indice, direcao):
         nova_ordem[indice], nova_ordem[novo_indice] = nova_ordem[novo_indice], nova_ordem[indice]
         st.session_state.ordem_grupos = nova_ordem
         st.rerun()
-def get_max_id(cur, tabela, campo_id):
-    cur.execute(f"SELECT COALESCE(MAX({campo_id}), 0) FROM {tabela}")
-    return cur.fetchone()[0]
 def descarregar_dados_para_postgres(group_dfs: dict[str, pd.DataFrame]):
-    import psycopg2
-    import pandas as pd
+    
+    # # === CONFIGURACAO ===
+    TRUNCAR_TABELAS = True
 
-    TRUNCAR_TABELAS = False
-
+    # === LIGACAO POSTGRES ===
     conn_inq = psycopg2.connect(
         host="10.90.0.50",
         database="postgres",
@@ -364,6 +360,7 @@ def descarregar_dados_para_postgres(group_dfs: dict[str, pd.DataFrame]):
     )
     cur_inq = conn_inq.cursor()
 
+    # === FUNCOES DE APOIO ===
     def truncar_tabelas():
         tabelas = [
             "resposta_formacao_inquerito",
@@ -382,135 +379,125 @@ def descarregar_dados_para_postgres(group_dfs: dict[str, pd.DataFrame]):
     if TRUNCAR_TABELAS:
         truncar_tabelas()
 
-    def get_max_id(cursor, table, id_field):
-        cursor.execute(f"SELECT COALESCE(MAX({id_field}), 0) FROM {table};")
-        return cursor.fetchone()[0]
+    # === 1. FORMACAO ===
+    df_formacao = group_dfs["formacoes"].head(5)
+    nomes_formacoes = df_formacao.columns[:5]
+    for idx, nome in enumerate(nomes_formacoes, start=1):
+        cur_inq.execute("""
+            INSERT INTO formacao (id_formacao, nome_formacao, id_formacao_base, id_grupo_formacao)
+            VALUES (%s, %s, NULL, NULL)
+        """, (idx, nome))
 
-    base_ids = {}
-    if not TRUNCAR_TABELAS:
-        base_ids["formacao"] = get_max_id(cur_inq, "formacao", "id_formacao") + 1
-        base_ids["inquerito"] = get_max_id(cur_inq, "inquerito", "id_inquerito") + 1
-        base_ids["res_formacao"] = get_max_id(cur_inq, "resposta_formacao_inquerito", "id_resposta_formacao_inquerito") + 1
-        base_ids["area"] = get_max_id(cur_inq, "area_tematica", "id_interesse") + 1
-        base_ids["res_area"] = get_max_id(cur_inq, "resposta_interesse_area_inquerito", "id_resposta_interesse_area_inquerito") + 1
-        base_ids["pref"] = get_max_id(cur_inq, "preferencia_ensino", "id_preferencia") + 1
-        base_ids["res_pref"] = get_max_id(cur_inq, "resposta_preferencia_ensino_inquerito", "id_resposta_preferencia_ensino_inquerito") + 1
-        base_ids["disp"] = get_max_id(cur_inq, "disponibilidade_horaria", "id_horario") + 1
-        base_ids["res_disp"] = get_max_id(cur_inq, "resposta_disponibilidade_horaria_inquerito", "id_resposta_disponibilidade_horaria_inquerito") + 1
-    else:
-        base_ids = dict.fromkeys([
-            "formacao", "inquerito", "res_formacao", "area",
-            "res_area", "pref", "res_pref", "disp", "res_disp"
-        ], 1)
+    # === 2. INQUERITO ===
+    df_inq = group_dfs["identificacao"].head(5)
+    df_inq.loc[:, "existe_responsavel"] = df_inq["existe_responsavel"].map({"Sim": 1, "Não": 0, "sim": 1, "não": 0})
+    for idx, row in df_inq.iterrows():
+        cur_inq.execute("""
+            INSERT INTO inquerito (id_inquerito, id_entidade, ano, data_submissao, existe_responsavel,
+                                nome_responsavel, percentagem_preenchido, tempo_realizacao)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            idx + 1,
+            int(row['id_entidade']) if pd.notna(row['id_entidade']) else None,
+            int(row['ano']) if pd.notna(row['ano']) else None,
+            row['data_submissao'].strftime("%Y-%m-%d") if pd.notna(row['data_submissao']) else None,
+            row['existe_responsavel'] if pd.notna(row['existe_responsavel']) else None,
+            row['nome_responsavel'] if pd.notna(row['nome_responsavel']) else None,
+            int(row['percentagem_preenchido']) if pd.notna(row['percentagem_preenchido']) else None,
+            int(row['tempo_realizacao']) if pd.notna(row['tempo_realizacao']) else None
+        ))
 
-    df_inq = group_dfs.get("identificacao")
-    if df_inq is not None:
-        if "existe_responsavel" in df_inq.columns:
-            df_inq["existe_responsavel"] = df_inq["existe_responsavel"].map({"Sim": 1, "Não": 0, "sim": 1, "não": 0})
-        else:
-            df_inq["existe_responsavel"] = None
+    # === 3. RESPOSTA FORMACAO INQUERITO ===
+    df_respostas = df_formacao.iloc[:5, :5]
+    resposta_id = 1
+    for i, row in df_respostas.iterrows():
+        id_inquerito = i + 1
+        for j, n_formandos in enumerate(row, start=1):
+            if pd.notna(n_formandos) and n_formandos > 0:
+                cur_inq.execute("""
+                    INSERT INTO resposta_formacao_inquerito (id_resposta_formacao_inquerito, n_formandos, id_inquerito, id_formacao)
+                    VALUES (%s, %s, %s, %s)
+                """, (resposta_id, int(n_formandos), id_inquerito, j))
+                resposta_id += 1
 
-        for idx, row in df_inq.iterrows():
-            cur_inq.execute("""
-                INSERT INTO inquerito (id_inquerito, id_entidade, ano, data_submissao, existe_responsavel,
-                                    nome_responsavel, percentagem_preenchido, tempo_realizacao)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                base_ids["inquerito"] + idx,
-                int(row['id_entidade']) if pd.notna(row['id_entidade']) else None,
-                int(row['ano']) if pd.notna(row['ano']) else None,
-                row['data_submissao'].strftime("%Y-%m-%d") if pd.notna(row['data_submissao']) else None,
-                row['existe_responsavel'] if pd.notna(row['existe_responsavel']) else None,
-                row['nome_responsavel'] if pd.notna(row['nome_responsavel']) else None,
-                int(row['percentagem_preenchido']) if pd.notna(row['percentagem_preenchido']) else None,
-                int(row['tempo_realizacao']) if pd.notna(row['tempo_realizacao']) else None
-            ))
+    # === 4. AREA TEMATICA + RESPOSTA INTERESSE ===
+    df_interesses = group_dfs["interesses"]
+    colunas_interesse = [c for c in df_interesses.columns if not c.endswith("[Comentário]")][:5]
 
-    df_formacao = group_dfs.get("formacoes")
-    if df_formacao is not None:
-        nomes_formacoes = df_formacao.columns
-        for idx, nome in enumerate(nomes_formacoes):
-            cur_inq.execute("""
-                INSERT INTO formacao (id_formacao, nome_formacao, id_formacao_base, id_grupo_formacao)
-                VALUES (%s, %s, NULL, NULL)
-            """, (base_ids["formacao"] + idx, nome))
+    for idx, nome in enumerate(colunas_interesse, start=1):
+        cur_inq.execute("""
+            INSERT INTO area_tematica (id_interesse, nome_area)
+            VALUES (%s, %s)
+        """, (idx, nome))
 
-        resposta_id = base_ids["res_formacao"]
-        for i, row in df_formacao.iterrows():
-            id_inquerito = base_ids["inquerito"] + i
-            for j, n_formandos in enumerate(row):
-                if pd.notna(n_formandos) and n_formandos > 0:
-                    cur_inq.execute("""
-                        INSERT INTO resposta_formacao_inquerito (id_resposta_formacao_inquerito, n_formandos, id_inquerito, id_formacao)
-                        VALUES (%s, %s, %s, %s)
-                    """, (resposta_id, int(n_formandos), id_inquerito, base_ids["formacao"] + j))
-                    resposta_id += 1
+    resposta_id = 1
+    for i, row in df_interesses.iloc[:5].iterrows():
+        id_inquerito = i + 1
+        for j, col in enumerate(colunas_interesse, start=1):
+            tem_interesse = row[col]
+            comentario = row.get(col + "[Comentário]", None)
+            comentario = comentario if pd.notna(comentario) else None
+            if pd.notna(tem_interesse) and int(tem_interesse) > 0:
+                cur_inq.execute("""
+                    INSERT INTO resposta_interesse_area_inquerito (id_resposta_interesse_area_inquerito, tem_interesse, n_formandos, comentario, id_inquerito, id_interesse)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (resposta_id, 1, int(tem_interesse), comentario if pd.notna(comentario) else None, id_inquerito, j))
+                resposta_id += 1
 
-    df_interesses = group_dfs.get("interesses")
-    if df_interesses is not None:
-        colunas_interesse = [c for c in df_interesses.columns if not c.endswith("[Comentário]")]
-        for idx, nome in enumerate(colunas_interesse):
-            cur_inq.execute("""
-                INSERT INTO area_tematica (id_interesse, nome_area)
-                VALUES (%s, %s)
-            """, (base_ids["area"] + idx, nome))
+    # === 5. PREFERENCIA ENSINO ===
+    df_pref = group_dfs["tipo de ensino"]
+    colunas_pref = df_pref.columns[:5]
+    for idx, nome in enumerate(colunas_pref, start=1):
+        cur_inq.execute("""
+            INSERT INTO preferencia_ensino (id_preferencia, descricao_preferencia)
+            VALUES (%s, %s)
+        """, (idx, nome))
 
-        resposta_id = base_ids["res_area"]
-        for i, row in df_interesses.iterrows():
-            id_inquerito = base_ids["inquerito"] + i
-            for j, col in enumerate(colunas_interesse):
-                tem_interesse = row[col]
-                comentario = row.get(col + "[Comentário]", None)
-                comentario = comentario if pd.notna(comentario) else None
-                if pd.notna(tem_interesse) and str(tem_interesse).strip().isdigit() and int(tem_interesse) > 0:
-                    cur_inq.execute("""
-                        INSERT INTO resposta_interesse_area_inquerito (id_resposta_interesse_area_inquerito, tem_interesse, n_formandos, comentario, id_inquerito, id_interesse)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (resposta_id, 1, int(tem_interesse), comentario, id_inquerito, base_ids["area"] + j))
-                    resposta_id += 1
+    resposta_id = 1
+    for i, row in df_pref.iloc[:5].iterrows():
+        id_inquerito = i + 1
+        for j, col in enumerate(colunas_pref, start=1):
+            valor = row[col]
+            if pd.notna(valor):
+                cur_inq.execute("""
+                    INSERT INTO resposta_preferencia_ensino_inquerito (id_resposta_preferencia_ensino_inquerito, valor_preferencia, id_inquerito, id_preferencia)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    resposta_id,
+                    int(valor) if pd.notna(valor) else None,
+                    id_inquerito,
+                    j
+                ))
+                resposta_id += 1
 
-    df_pref = group_dfs.get("tipo de ensino")
-    if df_pref is not None:
-        colunas_pref = df_pref.columns
-        for idx, nome in enumerate(colunas_pref):
-            cur_inq.execute("""
-                INSERT INTO preferencia_ensino (id_preferencia, descricao_preferencia)
-                VALUES (%s, %s)
-            """, (base_ids["pref"] + idx, nome))
+    # === 6. DISPONIBILIDADE HORARIA ===
+    df_disp = group_dfs["disponibilidade"]
+    colunas_disp = df_disp.columns[:5]
+    for idx, nome in enumerate(colunas_disp, start=1):
+        cur_inq.execute("""
+            INSERT INTO disponibilidade_horaria (id_horario, descricao_horario)
+            VALUES (%s, %s)
+        """, (idx, nome))
 
-        resposta_id = base_ids["res_pref"]
-        for i, row in df_pref.iterrows():
-            id_inquerito = base_ids["inquerito"] + i
-            for j, col in enumerate(colunas_pref):
-                valor = row[col]
-                if pd.notna(valor):
-                    cur_inq.execute("""
-                        INSERT INTO resposta_preferencia_ensino_inquerito (id_resposta_preferencia_ensino_inquerito, valor_preferencia, id_inquerito, id_preferencia)
-                        VALUES (%s, %s, %s, %s)
-                    """, (resposta_id, int(valor), id_inquerito, base_ids["pref"] + j))
-                    resposta_id += 1
+    resposta_id = 1
+    for i, row in df_disp.iloc[:5].iterrows():
+        id_inquerito = i + 1
+        for j, col in enumerate(colunas_disp, start=1):
+            tem_disp = row[col]
+            if pd.notna(tem_disp):
+                cur_inq.execute("""
+                    INSERT INTO resposta_disponibilidade_horaria_inquerito (id_resposta_disponibilidade_horaria_inquerito, tem_disponibilidade, id_inquerito, id_horario)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    resposta_id,
+                    int(tem_disp) if pd.notna(tem_disp) else None,
+                    id_inquerito,
+                    j
+                ))
+                resposta_id += 1
 
-    df_disp = group_dfs.get("disponibilidade")
-    if df_disp is not None:
-        colunas_disp = df_disp.columns
-        for idx, nome in enumerate(colunas_disp):
-            cur_inq.execute("""
-                INSERT INTO disponibilidade_horaria (id_horario, descricao_horario)
-                VALUES (%s, %s)
-            """, (base_ids["disp"] + idx, nome))
 
-        resposta_id = base_ids["res_disp"]
-        for i, row in df_disp.iterrows():
-            id_inquerito = base_ids["inquerito"] + i
-            for j, col in enumerate(colunas_disp):
-                tem_disp = row[col]
-                if pd.notna(tem_disp):
-                    cur_inq.execute("""
-                        INSERT INTO resposta_disponibilidade_horaria_inquerito (id_resposta_disponibilidade_horaria_inquerito, tem_disponibilidade, id_inquerito, id_horario)
-                        VALUES (%s, %s, %s, %s)
-                    """, (resposta_id, int(tem_disp), id_inquerito, base_ids["disp"] + j))
-                    resposta_id += 1
-
+    # === CONFIRMAR E FECHAR ===
     conn_inq.commit()
     cur_inq.close()
     conn_inq.close()
@@ -661,6 +648,7 @@ def show_config_page():
         st.session_state.page = "home"
         st.rerun()
 def show_processo_page():
+    df_original = None
     st.title("Iniciar novo Processo de ETL")
     st.write("Execução do processo ETL com base numa configuração.")
     show_conection_mongo_status()
@@ -689,7 +677,7 @@ def show_processo_page():
         st.success(f"Ficheiro `{uploaded_file.name}` mantido.")
         try:
             if uploaded_file.name.endswith(".csv"):
-                df = pd.read_csv(uploaded_file)
+                df_original = pd.read_csv(uploaded_file)
             else:
                 df_original = pd.read_excel(uploaded_file)
             st.session_state.df_original = df_original
@@ -1608,11 +1596,6 @@ def show_process_map():
                     st.session_state.page = "process_confirm_page"
                 st.rerun()              
 def show_process_confirm_page():
-    df_new = st.session_state.get("df_new")
-    if df_new is None:
-        st.warning("Dados do processo incompletos.")
-        return
-    n_rows = df_new.shape[0]
     st.title("Confirmação do Processo ETL")
     st.markdown("Revê os dados após o processamento ETL, incluindo entidades válidas, duplicadas e sem correspondência.")
 
@@ -1623,6 +1606,11 @@ def show_process_confirm_page():
 
     tab1, tab2, tab3 = st.tabs(["Visualização Global", "Revisão Duplicados", "Revisão Entidades sem correspondência"])
 
+    df_new = st.session_state.get("df_new")
+    if df_new is None:
+        st.warning("Dados do processo incompletos.")
+        return
+    n_rows = df_new.shape[0]
 
     if "etl_result" not in st.session_state:
         if mongo_connected:
@@ -1824,11 +1812,7 @@ def show_process_confirm_page():
     with col2:
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            for sheet_name, df in group_dfs.items():
-                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-            duplicates_df.to_excel(writer, sheet_name="duplicados", index=False)
-            no_match_df.to_excel(writer, sheet_name="entidades_invalidas", index=False)
-            all_data_df.to_excel(writer, sheet_name="all_data", index=False)
+            df_new.to_excel(writer, sheet_name="df_new", index=False)
         buffer.seek(0)
 
         st.download_button(
@@ -1840,8 +1824,7 @@ def show_process_confirm_page():
         )
 
     with col3:
-        if st.button("Exportar para a BD 📦", disabled=not mongo_connected):
-            descarregar_dados_para_postgres(group_dfs   )
+        st.button("Exportar para a BD 📦", disabled=not mongo_connected)
 
     with col4:
         if st.button("Concluir ➡️", key="btn_avancar"):
