@@ -58,7 +58,6 @@ def extract_content_in_brackets(text: str) -> str:
     match = re.search(r"\[(.*?)\]", str(text))
     if match:
         res = match.group(1).strip()
-        print(f"🔍 Extraído de '{text}': '{res}'")
         return res
     return str(text).strip()
 def query_to_df(cur, sql: str) -> pd.DataFrame:
@@ -362,12 +361,12 @@ def connect_survey_bd():
         st.session_state["survey_cur"] = None
         print(f"\nError connecting Survey DB: {e}\n")
     return False
-def move_group(index, direction):
-            new_order = st.session_state.ordem_grupos.copy()
-            new_index = index + direction
-            if 0 <= new_index < len(new_order):
-                new_order[index], new_order[new_index] = new_order[new_index], new_order[index]
-                st.session_state.ordem_grupos = new_order
+def move_group(session_key, index, direction):
+    lista = st.session_state.get(session_key, [])
+    new_index = index + direction
+    if 0 <= new_index < len(lista):
+        lista[index], lista[new_index] = lista[new_index], lista[index]
+        st.session_state[session_key] = lista
 def get_max_id(cur, tabela, campo_id):
     cur.execute(f"SELECT COALESCE(MAX({campo_id}), 0) FROM {tabela}")
     return cur.fetchone()[0]
@@ -514,23 +513,56 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
     tipos_disp = cur_inq.fetchall()
     map_tipos = {desc.strip(): id_ for id_, desc in tipos_disp}
 
-    # 2. Gerar df_disp
+   # 2. Gerar df_disp
     df_disp = group_dfs.get("disponibilidade")
     if df_disp is not None:
         colunas_disp = df_disp.columns
 
-        # Inserir disponibilidade_horaria
         for idx, nome in enumerate(colunas_disp):
+            nome_norm = normalize_text(nome)
             id_tipo = None
+
             for tipo_prefixo, id_ in map_tipos.items():
-                if nome.startswith(f"{tipo_prefixo} -"):
+                tipo_norm = normalize_text(f"{tipo_prefixo} -")
+                if nome_norm.startswith(tipo_norm):
                     id_tipo = id_
                     break
 
-            cur_inq.execute("""
-                INSERT INTO disponibilidade_horaria (id_horario, descricao_horario, id_tipo_disp)
-                VALUES (%s, %s, %s)
-            """, (base_ids["disp"] + idx, nome, id_tipo))
+            descricao = extract_content_in_brackets(nome)
+
+            id_horario_map = {}
+
+            for idx, nome in enumerate(colunas_disp):
+                nome_norm = normalize_text(nome)
+                id_tipo = None
+
+                for tipo_prefixo, id_ in map_tipos.items():
+                    tipo_norm = normalize_text(f"{tipo_prefixo} -")
+                    if nome_norm.startswith(tipo_norm):
+                        id_tipo = id_
+                        break
+
+                descricao = extract_content_in_brackets(nome)
+
+                # Verificar se já existe e obter id_horario
+                cur_inq.execute("""
+                    SELECT id_horario FROM disponibilidade_horaria
+                    WHERE descricao_horario = %s AND id_tipo_disp = %s
+                """, (descricao, id_tipo))
+
+                result = cur_inq.fetchone()
+
+                if result:
+                    id_horario = result[0]
+                else:
+                    id_horario = base_ids["disp"] + idx
+                    cur_inq.execute("""
+                        INSERT INTO disponibilidade_horaria (id_horario, descricao_horario, id_tipo_disp)
+                        VALUES (%s, %s, %s)
+                    """, (id_horario, descricao, id_tipo))
+
+                # Guardar mapeamento
+                id_horario_map[nome] = id_horario
 
         # Inserir respostas
         resposta_id = base_ids["res_disp"]
@@ -539,16 +571,18 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
             for j, col in enumerate(colunas_disp):
                 tem_disp = row[col]
                 if pd.notna(tem_disp):
-                    cur_inq.execute("""
-                        INSERT INTO resposta_disponibilidade_horaria_inquerito (
-                            id_resposta_disponibilidade_horaria_inquerito,
-                            tem_disponibilidade,
-                            id_inquerito,
-                            id_horario
-                        )
-                        VALUES (%s, %s, %s, %s)
-                    """, (resposta_id, int(tem_disp), id_inquerito, base_ids["disp"] + j))
-                    resposta_id += 1
+                    id_horario = id_horario_map.get(col)
+                    if id_horario is not None:
+                        cur_inq.execute("""
+                            INSERT INTO resposta_disponibilidade_horaria_inquerito (
+                                id_resposta_disponibilidade_horaria_inquerito,
+                                tem_disponibilidade,
+                                id_inquerito,
+                                id_horario
+                            )
+                            VALUES (%s, %s, %s, %s)
+                        """, (resposta_id, int(tem_disp), id_inquerito, id_horario))
+                        resposta_id += 1
 
 
     conn_inq.commit()
@@ -1062,9 +1096,9 @@ def show_process_groups():
                         end = st.number_input("End", min_value=1, max_value=total_columns, step=1,
                                             key=f"{group}_end", label_visibility="collapsed", disabled=not active)
                     with c3:
-                        st.button("⬆️", key=f"up_{group}", disabled=(i == 0), on_click=move_group, args=(i, -1))
+                        st.button("⬆️", key=f"up_{group}", disabled=(i == 0), on_click=move_group, args=("ordem_grupos",i, -1))
                     with c4:
-                        st.button("⬇️", key=f"down_{group}", disabled=(i == len(group_order) - 1), on_click=move_group, args=(i, 1))
+                        st.button("⬇️", key=f"down_{group}", disabled=(i == len(group_order) - 1), on_click=move_group, args=("ordem_grupos",i, 1))
                     with c5:
                         prev = active
                         novo = st.checkbox("Ativo", value=prev, key=f"{group}_ativo", disabled=(group == "identificacao"))
@@ -1286,7 +1320,7 @@ def show_process_map():
     if connect_survey_bd() and ("descricao_tipo_disp" not in df_tipos.columns or df_tipos.empty):
         try:
             df_tipos = pd.read_sql(
-                "SELECT descricao_tipo_disp FROM tipos_disponibilidades ORDER BY id_tipo_disp",
+                "SELECT id_tipo_disp , descricao_tipo_disp FROM tipos_disponibilidades ORDER BY id_tipo_disp",
                 st.session_state["survey_conn"]
             )
         except Exception as e:
@@ -1303,7 +1337,7 @@ def show_process_map():
             non_critical_fields = [f["field"] for f in doc.get("identification_fields", []) if not f["critical"]]
             fields = critical_fields + non_critical_fields
 
-    # Fields Inquiry
+    # Fields Survey
     group_dfs = {}
     df_new = st.session_state.get("df_new")
     df_new.columns = [col.lstrip() for col in df_new.columns] # PASSAR ISTO PARA A PÁGINA DE LIMPEZA
@@ -1335,8 +1369,6 @@ def show_process_map():
                 unmatched_critical_fields.append(field)
             elif field in non_critical_fields:
                 unmatched_non_critical_fields.append(field)
-
-
 
     # SII Entity Types 
     cur = st.session_state.get("sii_cur")
@@ -1440,18 +1472,18 @@ def show_process_map():
                         st.markdown("<div style='height: 76px;'></div>", unsafe_allow_html=True)
 
             # 2ª Secção
-            if unmatched_critical_fields:
+            if unmatched_critical_fields and st.session_state.mongo_connected and st.session_state.sii_connected:
                 st.session_state.mapping_critical_valid = False
                 st.error(f"❌ Campos críticos sem correspondência no grupo 'identificacao': {', '.join(unmatched_critical_fields)}")
-            else:
+            elif st.session_state.mongo_connected and st.session_state.sii_connected:
                 st.session_state.mapping_critical_valid = True
                 st.success("✅ Todos os campos críticos têm correspondência no grupo 'identificacao'.")
 
 
-            if unmatched_non_critical_fields:
+            if unmatched_non_critical_fields and st.session_state.mongo_connected and st.session_state.sii_connected:
                 st.warning(f"⚠️ Campos não críticos sem correspondência no grupo 'identificacao': '{', '.join(unmatched_non_critical_fields)}'")
                 st.session_state.mapping_confirm = True
-            else:
+            elif st.session_state.mongo_connected and st.session_state.sii_connected:
                 st.info("ℹ️ Todos os campos não críticos têm correspondência no grupo 'identificacao'.")
     with tab2:
         if "tipo_entidade" not in unmatched_non_critical_fields:
@@ -1637,177 +1669,156 @@ def show_process_map():
                                 unsafe_allow_html=True
                             )
     with tab4:
-        if not df_tipos.empty:
-            availabilities_types = df_tipos["descricao_tipo_disp"].tolist()
-        else:
-            availabilities_types = None
+        df_final = df_new.copy()
 
-        # Inicialização segura dos grupos
-        if "grupos_ativos_disp" not in st.session_state:
-            st.session_state.grupos_ativos_disp = {}
-        if "grupos_validacao_disp" not in st.session_state:
-            st.session_state.grupos_validacao_disp = {}
+        col_l, col_r = st.columns([1,1.5])
+        with col_l:
+            availability_types = df_tipos["descricao_tipo_disp"].to_list()
+            start_disp = st.session_state.grupos_validacao["disponibilidade"]["start"]
+            end_disp = st.session_state.grupos_validacao["disponibilidade"]["end"]
 
-        if availabilities_types:
-            for tipo in availabilities_types:
-                st.session_state.grupos_ativos_disp.setdefault(tipo, True)
-                st.session_state.grupos_validacao_disp.setdefault(tipo, {"start": None, "end": None, "overlay": False})
+            st.subheader("Definir grupos")
 
-        if "disponibilidade" in group_dfs:
-            total_columns = len(group_dfs["disponibilidade"].columns)
+            st.session_state.setdefault("grupos_validacao_disp", {g: {"start": None, "end": None, "overlay": True} for g in availability_types})
+            st.session_state.setdefault("grupos_ativos_disp", {g: True for g in availability_types})
 
-            col_esq, col_dir = st.columns([1, 2])
-            with col_esq:
-                with st.container(border=True):
-                    st.subheader("Definir tipos de disponibilidades")
-                    previous_active_group_end = 0
+            previous_active_group_end = 0
 
-                    if availabilities_types:
-                        for i, tipo in enumerate(availabilities_types):
-                            with st.container():
-                                st.markdown(f"""
-                                <div style="background-color: #326d00; padding: 10px 15px; border-radius: 10px; margin-bottom: 10px; margin-top: 10px;">
-                                    <div style="font-size: 16px; font-weight: bold;">#{i+1} - {tipo}</div>
-                                </div>
-                                """, unsafe_allow_html=True)
-
-                                c1, c2, c3, c4, c5 = st.columns([2, 2, 1, 1, 2])
-                                active = st.session_state.grupos_ativos_disp[tipo]
-
-                                with c1:
-                                    start = st.number_input("Start", min_value=1, max_value=total_columns, step=1,
-                                                            key=f"{tipo}_start", label_visibility="collapsed", disabled=not active)
-                                with c2:
-                                    end = st.number_input("End", min_value=1, max_value=total_columns, step=1,
-                                                        key=f"{tipo}_end", label_visibility="collapsed", disabled=not active)
-                                with c3:
-                                    st.button("⬆️", key=f"up_{tipo}", disabled=(i == 0), on_click=move_group, args=(i, -1))
-                                with c4:
-                                    st.button("⬇️", key=f"down_{tipo}", disabled=(i == len(availabilities_types) - 1), on_click=move_group, args=(i, 1))
-                                with c5:
-                                    prev = active
-                                    novo = st.checkbox("Ativo", value=prev, key=f"{tipo}_ativo", disabled=(tipo == "identificacao"))
-                                    if novo != prev:
-                                        st.session_state.grupos_ativos_disp[tipo] = novo
-                                        st.rerun()
-
-                                if not active:
-                                    st.session_state.grupos_validacaodisp[tipo].update({"start": None, "end": None, "overlay": False})
-                                    continue
-
-                                overlay = previous_active_group_end and start <= previous_active_group_end
-                                st.session_state.grupos_validacao_disp[tipo].update({"start": start, "end": end, "overlay": overlay})
-
-            with col_dir:
-                with st.container(border=True):
-                    st.subheader("Visualização das colunas")
-
-                    ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 1])
-                    with ctrl1:
-                        cols_per_page = st.number_input("Nº de colunas por página", min_value=5, max_value=100, value=10, step=5)
-                    total_pages = math.ceil(total_columns / cols_per_page)
-                    with ctrl2:
-                        current_page = st.number_input("Página", min_value=1, max_value=total_pages, value=1, step=1)
-                    with ctrl3:
-                        st.markdown(f"""
-                            <div style=\"margin-top:30px; font-weight:bold; font-size:20px\">
-                                Total de colunas: {total_columns}
-                            </div>""", unsafe_allow_html=True)
-
-                    start_idx = (current_page - 1) * cols_per_page
-                    end_idx = min(start_idx + cols_per_page, total_columns)
-
-                    st.markdown(f"**Colunas {start_idx + 1} a {end_idx}**")
-
-                    for i in range(start_idx, end_idx):
-                        col_name = group_dfs["disponibilidade"].columns[i]
-                        idx_display = i + 1
-                        bg_color = "#326d00" if i % 2 == 0 else "#121212"
-                        st.markdown(f"""
-                            <div title=\"{col_name}\" style=\"
-                                background-color:{bg_color};
-                                padding:6px 10px;
-                                border-radius:6px;
-                                margin-bottom:4px;
-                                font-size:13px;
-                                color:white;
-                                height:32px;
-                                line-height:20px;
-                                overflow:hidden;
-                                white-space:nowrap;
-                                text-overflow:ellipsis;
-                            \">
-                                <strong>{idx_display}</strong>: {col_name}
-                            </div>""", unsafe_allow_html=True)
-            
-            if availabilities_types:
-                previous_end = 0
-                for tipo in availabilities_types:
-                    if not st.session_state.grupos_ativos[tipo]:
-                        continue
-
-                    start = st.session_state.grupos_validacao_disp[tipo]["start"]
-                    end = st.session_state.grupos_validacao_disp[tipo]["end"]
-
-                    if start is None or end is None or start > end:
-                        st.session_state.grupos_validacao_disp[tipo]["overlay"] = False
-                        st.error(f"⚠️ Intervalo inválido no grupo '{tipo}'")
-                        continue
-
-                    overlay = start <= previous_end
-                    st.session_state.grupos_validacao_disp[tipo]["overlay"] = overlay
-
-                    if overlay:
-                        st.error(f"⚠️ Sobreposição com grupo anterior no grupo '{tipo}'")
-                    else:
-                        previous_end = end
-
-            st.subheader("Pré-visualização dos tipos de disponibilidade definidos")
-            valid_availabilities = []
-            cols_disp = list(group_dfs["disponibilidade"].columns)
-
-            if availabilities_types:
-                for tipo in availabilities_types:
-                    if not st.session_state.grupos_ativos_disp.get(tipo, True):
-                        continue
-                    info = st.session_state.grupos_validacao_disp.get(tipo, {})
-                    start, end = info.get("start"), info.get("end")
-                    overlap = info.get("overlay", True)
-
-                    if isinstance(start, int) and isinstance(end, int) and 1 <= start <= end <= len(cols_disp) and not overlap:
-                        tipo_cols = [f"{tipo} - {col}" for col in cols_disp[start - 1:end]]
-                        valid_availabilities.append((tipo, start, end, tipo_cols))
-
-            if len(valid_availabilities) == 0:
-                st.info("Ainda não existe nenhum tipo de disponibilidade válido.")
-
-            # Mostra as colunas definidas
-            for i in range(0, len(valid_availabilities), 2):
-                row = valid_availabilities[i:i + 2]
-                cols = st.columns(len(row))
-                for j, (tipo, start, end, tipo_cols) in enumerate(row):
-                    content = "".join(f"<li>{c}</li>" for c in tipo_cols)
-                    html = f"""
-                    <div style="
-                        border-radius: 16px;
-                        padding: 16px;
-                        background-color: #326d00;
-                        color: white;
-                        box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
-                        max-height: 250px;
-                        overflow-y: auto;
-                    ">
-                        <h4 style="margin-top:0;">{tipo} ({start}–{end})</h4>
-                        <ul style="margin-left: 20px; padding-right: 10px;">{content}</ul>
+            # Iterate over each group and create input controls
+            for i, group in enumerate(availability_types):
+                with st.container():
+                    # Group header
+                    st.markdown(f"""
+                    <div style="background-color: #326d00; padding: 10px 15px; border-radius: 10px; margin-bottom: 10px;">
+                        <div style="font-size: 16px; font-weight: bold;">#{i+1} - {group.capitalize()}</div>
                     </div>
-                    """
-                    with cols[j]:
-                        with st.expander(f"{tipo} ({start}–{end}) - {len(tipo_cols)} colunas", expanded=True):
-                            st.markdown(html, unsafe_allow_html=True)
-                                
-        else:
-            st.warning("O grupo 'disponibilidade' ainda não está definido.")
+                    """, unsafe_allow_html=True)
 
+                    # Control inputs for start, end, move up/down, and toggle
+                    c1, c2, c3 = st.columns([2, 2, 1])
+                    active = st.session_state.grupos_ativos_disp[group]
+
+                    with c1:
+                        start = st.number_input("Start", min_value=start_disp, max_value=end_disp, step=1,
+                                                key=f"{group}_start", label_visibility="collapsed", disabled=not active)
+                    with c2:
+                        end = st.number_input("End", min_value=start_disp, max_value=end_disp, step=1,
+                                            key=f"{group}_end", label_visibility="collapsed", disabled=not active)
+                    with c3:
+                        prev = active
+                        novo = st.checkbox("Ativo", value=prev, key=f"{group}_ativo", disabled=(group == "identificacao"))
+                        if novo != prev:
+                            st.session_state.grupos_ativos_disp[group] = novo
+                            st.rerun()
+
+                    # Update validation and track overlapping
+                    if not active:
+                        st.session_state.grupos_validacao_disp[group].update({"start": None, "end": None, "overlay": False})
+                        continue
+
+                    overlay = previous_active_group_end and start <= previous_active_group_end
+                    st.session_state.grupos_validacao_disp[group].update({"start": start, "end": end, "overlay": overlay})
+
+        with col_r:
+            start_disp = st.session_state.grupos_validacao["disponibilidade"]["start"]
+            end_disp = st.session_state.grupos_validacao["disponibilidade"]["end"]
+            ativo_disp = st.session_state.grupos_ativos.get("disponibilidade", False)
+
+            if ativo_disp and start_disp and end_disp and start_disp <= end_disp:
+                st.subheader("Pré-visualização: Grupo 'disponibilidade'")
+
+                colunas_disp = df_new.columns[start_disp - 1:end_disp]
+                total_cols = len(colunas_disp)
+
+                # Controlo de paginação
+                ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1,1,2,1])
+                with ctrl1:
+                    cols_per_page = st.number_input(
+                        "Nº de colunas por página", min_value=1, max_value=total_cols,
+                        value=min(10, total_cols), step=1, key="cols_per_page_disp"
+                    )
+                total_pages = math.ceil(total_cols / cols_per_page)
+                with ctrl2:
+                    current_page = st.number_input(
+                        "Página", min_value=1, max_value=total_pages,
+                        value=1, step=1, key="page_disp"
+                    )
+                start_idx = (current_page - 1) * cols_per_page
+                end_idx = min(start_idx + cols_per_page, total_cols)
+                colunas_pag = colunas_disp[start_idx:end_idx]
+
+                with ctrl3:
+                    st.markdown(f"""
+                        <div style=\"margin-top:30px; font-weight:bold; font-size:20px\">
+                            Colunas {start_disp + start_idx} a {start_disp + end_idx - 1}
+                        </div>""", unsafe_allow_html=True)
+                    
+                with ctrl4:
+                    if st.button("Renomear"):
+                        renomeados = {}
+                        for tipo in availability_types:
+                            if not st.session_state.grupos_ativos_disp[tipo]:
+                                continue
+
+                            start = st.session_state.grupos_validacao_disp[tipo]["start"]
+                            end = st.session_state.grupos_validacao_disp[tipo]["end"]
+
+                            if start is None or end is None or start > end:
+                                continue
+
+                            colunas_do_tipo = df_final.columns[start - 1:end]
+                            for col in colunas_do_tipo:
+                                novo_nome = f"{tipo} - {col}"
+                                renomeados[col] = novo_nome
+
+                        df_final.rename(columns=renomeados, inplace=True)
+                        st.session_state.df_final = df_final.copy()
+                        st.success("Colunas renomeadas com o tipo respetivo.")
+                        st.rerun()
+
+                # Lista visual das colunas
+                for i, col in enumerate(colunas_pag, start=start_disp + start_idx):
+                    bg_color = "#326d00" if i % 2 == 0 else "#121212"
+                    st.markdown(f"""
+                        <div title="{col}" style="
+                            background-color:{bg_color};
+                            padding:6px 10px;
+                            border-radius:6px;
+                            margin-bottom:4px;
+                            font-size:13px;
+                            color:white;    
+                            height:32px;
+                            line-height:20px;
+                            overflow:hidden;
+                            white-space:nowrap;
+                            text-overflow:ellipsis;
+                        ">
+                            <strong>{i}</strong>: {col}
+                        </div>""", unsafe_allow_html=True)
+
+            else:
+                st.info("O grupo 'disponibilidade' ainda não está corretamente definido ou não está ativo.")
+
+        previous_end = 0
+        for group in availability_types:
+            if not st.session_state.grupos_ativos_disp[group]:
+                continue
+
+            start = st.session_state.grupos_validacao_disp[group]["start"]
+            end = st.session_state.grupos_validacao_disp[group]["end"]
+
+            if start is None or end is None or start > end:
+                st.session_state.grupos_validacao_disp[group]["overlay"] = False
+                st.error(f"⚠️ Intervalo inválido no grupo '{group}'")
+                continue
+
+            overlay = start <= previous_end
+            st.session_state.grupos_validacao_disp[group]["overlay"] = overlay
+
+            if overlay:
+                st.error(f"⚠️ Sobreposição com grupo anterior no grupo '{group}'")
+            else:
+                previous_end = end
 
     # Navigation
     st.markdown("---")
@@ -1853,15 +1864,15 @@ def show_process_map():
     show_conection_mongo_status()
     show_conection_sii_status()            
 def show_process_confirm_page():
-    df_new = st.session_state.get("df_new")
-    if df_new is None:
+    df_final = st.session_state.get("df_final")
+    if df_final is None:
         st.warning("Dados do processo incompletos.")
         return
 
     mongo_connected = st.session_state.get("mongo_connected", False)
     sii_connected = st.session_state.get("sii_connected", False)
 
-    n_rows = df_new.shape[0]
+    n_rows = df_final.shape[0]
     st.title("Confirmação do Processo ETL")
     st.markdown("Revê os dados após o processamento ETL, incluindo entidades válidas, duplicadas e sem correspondência.")
 
@@ -1872,12 +1883,12 @@ def show_process_confirm_page():
             with st.spinner("🚀 A executar o processo ETL..."):
                 group_dfs, duplicates_df, no_match_df = run_etl(
                     year=st.session_state.selected_year,
-                    df=df_new,
+                    df=df_final,
                     mongo_db=st.session_state.get("mdb"),
                     cur_sii=st.session_state.get("sii_cur")
                 )
         else:
-            group_dfs = {"identificacao": df_new.copy()}
+            group_dfs = {"identificacao": df_final.copy()}
             duplicates_df = pd.DataFrame(columns=["id_entidade", "nome_entidade"])
             no_match_df = pd.DataFrame(columns=["id_entidade", "nome_entidade"])
 
