@@ -444,25 +444,52 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
                 int(row['tempo_realizacao']) if pd.notna(row['tempo_realizacao']) else None
             ))
 
+    # Formations
     df_formacao = group_dfs.get("formacoes")
     if df_formacao is not None:
         nomes_formacoes = df_formacao.columns
-        for idx, nome in enumerate(nomes_formacoes):
-            cur_inq.execute("""
-                INSERT INTO formacao (id_formacao, nome_formacao, id_formacao_base, id_grupo_formacao)
-                VALUES (%s, %s, NULL, NULL)
-            """, (base_ids["formacao"] + idx, nome))
+        formacoes_existentes = set()
+        formacao_id_map = {}
 
+        # Buscar todas as formações já existentes com os seus IDs
+        cur_inq.execute("SELECT id_formacao, nome_formacao FROM formacao")
+        for id_f, nome in cur_inq.fetchall():
+            nome_norm = normalize_text(nome)
+            formacoes_existentes.add(nome_norm)
+            formacao_id_map[nome_norm] = id_f
+
+        id_formacao = base_ids["formacao"]
         resposta_id = base_ids["res_formacao"]
+
+        for nome in nomes_formacoes:
+            nome_norm = normalize_text(nome)
+            if nome_norm not in formacoes_existentes:
+                # Inserir nova formação
+                cur_inq.execute("""
+                    INSERT INTO formacao (id_formacao, nome_formacao, id_formacao_base, id_grupo_formacao)
+                    VALUES (%s, %s, NULL, NULL)
+                """, (id_formacao, nome))
+                formacoes_existentes.add(nome_norm)
+                formacao_id_map[nome_norm] = id_formacao
+                id_formacao += 1
+
         for i, row in df_formacao.iterrows():
             id_inquerito = base_ids["inquerito"] + i
             for j, n_formandos in enumerate(row):
-                if pd.notna(n_formandos) and n_formandos > 0:
-                    cur_inq.execute("""
-                        INSERT INTO resposta_formacao_inquerito (id_resposta_formacao_inquerito, n_formandos, id_inquerito, id_formacao)
-                        VALUES (%s, %s, %s, %s)
-                    """, (resposta_id, int(n_formandos), id_inquerito, base_ids["formacao"] + j))
-                    resposta_id += 1
+                if pd.notna(n_formandos) and n_formandos >= 0:
+                    nome_formacao = nomes_formacoes[j]
+                    nome_norm = normalize_text(nome_formacao)
+                    id_formacao_uso = formacao_id_map.get(nome_norm)
+
+                    if id_formacao_uso is not None:
+                        cur_inq.execute("""
+                            INSERT INTO resposta_formacao_inquerito (id_resposta_formacao_inquerito, n_formandos, id_inquerito, id_formacao)
+                            VALUES (%s, %s, %s, %s)
+                        """, (resposta_id, int(n_formandos), id_inquerito, id_formacao_uso))
+                        resposta_id += 1
+                    else:
+                        print(f"⚠️ Formação '{nome_formacao}' não encontrada no mapa.")
+
 
     df_interesses = group_dfs.get("interesses")
     if df_interesses is not None:
