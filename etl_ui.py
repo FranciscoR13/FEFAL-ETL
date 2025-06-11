@@ -74,7 +74,6 @@ def run_etl(year: int, df: pd.DataFrame, mongo_db, cur_sii) -> tuple[dict[str, p
         df.columns = [normalize_text(col).strip() for col in df.columns]
         group_dfs[name] = rename_cols(df, configs["map_ren_col"], strict=(name == "identificacao"))
 
-
     # Process identification
     df_id = group_dfs["identificacao"]  
     df_id = df_id[~df_id["nome_entidade"].apply(normalize_text).isin(["", "nd", "nan", "n/a", "na", "não definido", "sem dados", None])]
@@ -100,7 +99,7 @@ def run_etl(year: int, df: pd.DataFrame, mongo_db, cur_sii) -> tuple[dict[str, p
     group_dfs = initialize_time_fields(group_dfs)
     group_dfs = process_additional_fields(group_dfs, year)
     group_dfs = process_formations(group_dfs)
-    # group_dfs = process_interests(group_dfs, configs["interests_keys"])
+    group_dfs = process_interests(group_dfs, configs["interests_keys"])
     group_dfs = process_availability(group_dfs)
     group_dfs = validate_preferences(group_dfs)
 
@@ -129,10 +128,11 @@ def run_etl(year: int, df: pd.DataFrame, mongo_db, cur_sii) -> tuple[dict[str, p
 
     return group_dfs, duplicate_df, unmatched_df
 def load_mongo_configs(mongo_db, year: int) -> dict:
-    interests_keys = mongo_db["ConfigAdvence"].find_one({"_id": ObjectId("682b5773188a7521e801a4e5")})
+    interests_keys = mongo_db["ConfigAdvanced"].find_one({"_id": ObjectId("682b5773188a7521e801a4e5")})
     ren_col = list(mongo_db["ConfigRenCol"].find({}, {"_id": 0}))
     col_map = mongo_db["ConfigColMap"].find_one({"year": year})
     ent_map = list(mongo_db["ConfigMapEnt"].find({}, {"_id": 0}))
+    print(f"\n\n interests_keys: {interests_keys}\n\n")
     return {
         "map_ren_col": create_map(ren_col, "original_name", "new_name"),
         "map_ent": create_map(ent_map, "tipo_entidade_inq", "tipo_entidade_norm"),
@@ -243,23 +243,44 @@ def process_formations(group_dfs):
     group_dfs["formacoes"] = df
     return group_dfs
 def process_interests(group_dfs, interests_keys):
-    if "interesses" not in group_dfs or group_dfs["interesses"].empty:
+    if "interesses" not in group_dfs:
+        print("Grupo 'interesses' não existe.")
+        return group_dfs
+    if group_dfs["interesses"].empty:
+        print("Grupo 'interesses' está vazio.")
         return group_dfs
 
     comment_keys = [normalize_text(k) for k in interests_keys.get("comment_keys", [])]
+    formando_keys = [normalize_text(k) for k in interests_keys.get("formando_keys", [])]
 
-    def map_interest(val):
-        v = normalize_text(str(val))
-        if v == "sim": return 1
-        if v == "nao": return 0
-        return pd.NA
+    df = group_dfs["interesses"].copy()
+    df.columns = [normalize_text(col) for col in df.columns]
 
-    df = group_dfs["interesses"]
-    for col in df.columns:
-        if all(kw not in normalize_text(col) for kw in comment_keys):
-            df[col] = df[col].apply(map_interest).astype("Int64")
+    df_comentarios = df[[col for col in df.columns if any(k in col for k in comment_keys)]]
+    df_formandos = df[[col for col in df.columns if any(k in col for k in formando_keys)]]
+    df_outros = df[[col for col in df.columns if not any(k in col for k in comment_keys + formando_keys)]]
 
-    group_dfs["interesses"] = df
+    def transformar_valor(val):
+        if isinstance(val, str):
+            val_lower = normalize_text(val)
+            if val_lower in ("sim"):
+                return 1
+            elif val_lower in ("nao"):
+                return 0
+        return None
+
+    df_outros = df_outros.applymap(transformar_valor)
+
+    # Atualiza os grupos no dicionário
+    if not df_comentarios.empty:
+        group_dfs["comentarios_interesse"] = df_comentarios
+    if not df_formandos.empty:
+        group_dfs["formandos_interesse"] = df_formandos
+    if not df_outros.empty:
+        group_dfs["interesses"] = df_outros
+    else:
+        group_dfs.pop("interesses", None)
+
     return group_dfs
 def process_availability(group_dfs):
     if "disponibilidade" not in group_dfs or group_dfs["disponibilidade"].empty:
@@ -415,10 +436,11 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
         base_ids["res_pref"] = get_max_id(cur_inq, "resposta_preferencia_ensino_inquerito", "id_resposta_preferencia_ensino_inquerito") + 1
         base_ids["disp"] = get_max_id(cur_inq, "disponibilidade_horaria", "id_horario") + 1
         base_ids["res_disp"] = get_max_id(cur_inq, "resposta_disponibilidade_horaria_inquerito", "id_resposta_disponibilidade_horaria_inquerito") + 1
+        base_ids["comentario"] = get_max_id(cur_inq, "comentario", "id_comentario") + 1 
     else:
         base_ids = dict.fromkeys([
             "formacao", "inquerito", "res_formacao", "area",
-            "res_area", "pref", "res_pref", "disp", "res_disp"
+            "res_area", "pref", "res_pref", "disp", "res_disp", "comentario"  
         ], 1)
 
     df_inq = group_dfs.get("identificacao")
@@ -490,10 +512,24 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
                     else:
                         print(f"⚠️ Formação '{nome_formacao}' não encontrada no mapa.")
 
-
+    # Int
     df_interesses = group_dfs.get("interesses")
-    if df_interesses is not None:
-        colunas_interesse = [c for c in df_interesses.columns if not c.endswith("[Comentário]")]
+    df_comentarios = group_dfs.get("comentarios_interesse")
+
+    print(f"\n\ndf_interesses -> {len(df_interesses.columns)}")
+    print(f"df_comentarios -> {len(df_comentarios.columns)}\n\n")
+
+    if df_interesses is not None and not df_interesses.empty:
+        df_interesses = df_interesses.reset_index(drop=True)
+
+        if df_comentarios is not None and not df_comentarios.empty:
+            df_comentarios = df_comentarios.reset_index(drop=True)
+
+        df_interesses.columns = df_interesses.columns.str.strip().str.replace('\n', ' ')
+        df_comentarios.columns = df_comentarios.columns.str.strip().str.replace('\n', ' ')
+
+        colunas_interesse = list(df_interesses.columns)
+
         for idx, nome in enumerate(colunas_interesse):
             cur_inq.execute("""
                 INSERT INTO area_tematica (id_interesse, nome_area)
@@ -501,18 +537,63 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
             """, (base_ids["area"] + idx, nome))
 
         resposta_id = base_ids["res_area"]
+        comentario_id = base_ids["comentario"]
+
         for i, row in df_interesses.iterrows():
             id_inquerito = base_ids["inquerito"] + i
+
             for j, col in enumerate(colunas_interesse):
                 tem_interesse = row[col]
-                comentario = row.get(col + "[Comentário]", None)
-                comentario = comentario if pd.notna(comentario) else None
-                if pd.notna(tem_interesse) and str(tem_interesse).strip().isdigit() and int(tem_interesse) > 0:
-                    cur_inq.execute("""
-                        INSERT INTO resposta_interesse_area_inquerito (id_resposta_interesse_area_inquerito, tem_interesse, n_formandos, comentario, id_inquerito, id_interesse)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (resposta_id, 1, int(tem_interesse), comentario, id_inquerito, base_ids["area"] + j))
-                    resposta_id += 1
+
+                if pd.notna(tem_interesse):
+                    try:
+                        valor = float(tem_interesse)
+                        if valor > 0:
+                            n_formandos = int(valor)
+
+                            # Verifica se há um comentário correspondente
+                            comentario_col = f"{col}[comentario]"
+                            texto = None
+                            if df_comentarios is not None and comentario_col in df_comentarios.columns:
+                                texto_raw = df_comentarios.at[i, comentario_col]
+                                if pd.notna(texto_raw):
+                                    if isinstance(texto_raw, (int, float)):
+                                        n_formandos = int(texto_raw)  # substitui valor
+                                    elif isinstance(texto_raw, str):
+                                        texto_str = texto_raw.strip()
+                                        if texto_str.replace(".", "", 1).isdigit():
+                                            n_formandos = int(float(texto_str))
+                                        elif texto_str:
+                                            texto = texto_str  # comentário textual
+
+
+                            # Inserir resposta
+                            cur_inq.execute("""
+                                INSERT INTO resposta_interesse_area_inquerito (
+                                    id_resposta_interesse_area_inquerito, tem_interesse, n_formandos, id_inquerito, id_interesse
+                                ) VALUES (%s, %s, %s, %s, %s)
+                            """, (
+                                resposta_id, 1, n_formandos,
+                                id_inquerito, base_ids["area"] + j
+                            ))
+
+                            # Se houver comentário textual, insere
+                            if texto:
+                                cur_inq.execute("""
+                                    INSERT INTO comentario (
+                                        id_comentario, id_resposta_interesse_area_inquerito, texto_comentario
+                                    ) VALUES (%s, %s, %s)
+                                """, (comentario_id, resposta_id, texto))
+                                comentario_id += 1
+
+                            resposta_id += 1
+                    except ValueError:
+                        pass
+
+    # Atualizar base_ids no final (opcional)
+    base_ids["res_area"] = resposta_id
+    base_ids["comentario"] = comentario_id
+
 
     df_pref = group_dfs.get("tipo de ensino")
     if df_pref is not None:
@@ -1894,6 +1975,11 @@ def show_process_confirm_page():
     df_final = st.session_state.get("df_final")
     if df_final is None:
         st.warning("Dados do processo incompletos.")
+        col1, col2, col3, col4 = st.columns([1, 7, 1.6, 1])
+        with col1:
+            if st.button("⬅️ Voltar", key="btn_voltar_erro"):
+                st.session_state.page = "process_map"
+                st.rerun()
         return
 
     mongo_connected = st.session_state.get("mongo_connected", False)
@@ -2083,7 +2169,7 @@ def show_process_confirm_page():
                         st.error("Falha ao carregar dados da base de dados SII.")
 
     st.markdown("---")
-    col1, col2, col3, col4 = st.columns([1, 7, 1.6, 1])
+    col1, col2, col3, col4, col5 = st.columns([1.1, 7, 1.9, 2.3, 1.3])
 
     with col1:
         if st.button("⬅️ Voltar", key="btn_voltar"):
@@ -2116,6 +2202,24 @@ def show_process_confirm_page():
             st.button("Exportar para a BD 📦", disabled=True, help="Requer ligação ativa ao SII.")
 
     with col4:
+        if mongo_connected:
+            if st.button("Executar ETL novamente 🚀"):
+                with st.spinner("🚀 A executar o processo ETL..."):
+                    group_dfs, duplicates_df, no_match_df = run_etl(
+                        year=st.session_state.selected_year,
+                        df=df_final,
+                        mongo_db=st.session_state.get("mdb"),
+                        cur_sii=st.session_state.get("sii_cur")
+                    )
+                st.session_state.etl_result = {
+                    "group_dfs": group_dfs,
+                    "duplicates_df": duplicates_df,
+                    "no_match_df": no_match_df
+                }
+        else:
+            st.button("Exportar para a BD 📦", disabled=True, help="Requer ligação ativa ao SII.")
+
+    with col5:
         if st.button("Concluir ➡️", key="btn_avancar"):
             st.session_state.clear()
             st.session_state.page = "home"
