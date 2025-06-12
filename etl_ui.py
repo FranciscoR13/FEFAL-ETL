@@ -393,78 +393,41 @@ def get_max_id(cur, tabela, campo_id):
     return cur.fetchone()[0]
 def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
 
-    TRUNCAR_TABELAS = False
-
     if connect_survey_bd():
         conn_inq = st.session_state["survey_conn"]
         cur_inq = st.session_state["survey_cur"]
     else:
         conn_inq = None
         cur_inq = None
-
-    def truncar_tabelas():
-        tabelas = [
-            "resposta_formacao_inquerito",
-            "resposta_interesse_area_inquerito",
-            "resposta_preferencia_ensino_inquerito",
-            "resposta_disponibilidade_horaria_inquerito",
-            "formacao",
-            "area_tematica",
-            "preferencia_ensino",
-            "disponibilidade_horaria",
-            "tipos_disponibilidades"
-            "inquerito"
-        ]
-        for tabela in tabelas:
-            cur_inq.execute(f"TRUNCATE {tabela} CASCADE;")
-
-    if TRUNCAR_TABELAS:
-        truncar_tabelas()
-
-    def get_max_id(cursor, table, id_field):
-        cursor.execute(f"SELECT COALESCE(MAX({id_field}), 0) FROM {table};")
-        return cursor.fetchone()[0]
-
-    base_ids = {}
-    if not TRUNCAR_TABELAS:
-        base_ids["formacao"] = get_max_id(cur_inq, "formacao", "id_formacao") + 1
-        base_ids["inquerito"] = get_max_id(cur_inq, "inquerito", "id_inquerito") + 1
-        base_ids["res_formacao"] = get_max_id(cur_inq, "resposta_formacao_inquerito", "id_resposta_formacao_inquerito") + 1
-        base_ids["area"] = get_max_id(cur_inq, "area_tematica", "id_interesse") + 1
-        base_ids["res_area"] = get_max_id(cur_inq, "resposta_interesse_area_inquerito", "id_resposta_interesse_area_inquerito") + 1
-        base_ids["pref"] = get_max_id(cur_inq, "preferencia_ensino", "id_preferencia") + 1
-        base_ids["res_pref"] = get_max_id(cur_inq, "resposta_preferencia_ensino_inquerito", "id_resposta_preferencia_ensino_inquerito") + 1
-        base_ids["disp"] = get_max_id(cur_inq, "disponibilidade_horaria", "id_horario") + 1
-        base_ids["res_disp"] = get_max_id(cur_inq, "resposta_disponibilidade_horaria_inquerito", "id_resposta_disponibilidade_horaria_inquerito") + 1
-        base_ids["comentario"] = get_max_id(cur_inq, "comentario", "id_comentario") + 1 
-    else:
-        base_ids = dict.fromkeys([
-            "formacao", "inquerito", "res_formacao", "area",
-            "res_area", "pref", "res_pref", "disp", "res_disp", "comentario"  
-        ], 1)
-
+    
     df_inq = group_dfs.get("identificacao")
+    inquerito_ids = []
+
     if df_inq is not None:
         if "existe_responsavel" in df_inq.columns:
-            df_inq["existe_responsavel"] = df_inq["existe_responsavel"].map({"Sim": 1, "Não": 0, "sim": 1, "não": 0})
+            df_inq["existe_responsavel"] = df_inq["existe_responsavel"].astype(str).str.lower().map({"sim": 1, "não": 0})
         else:
             df_inq["existe_responsavel"] = None
 
         for idx, row in df_inq.iterrows():
             cur_inq.execute("""
-                INSERT INTO inquerito (id_inquerito, id_entidade, ano, data_submissao, existe_responsavel,
-                                    nome_responsavel, percentagem_preenchido, tempo_realizacao)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO inquerito (
+                    id_entidade, ano, data_submissao, existe_responsavel,
+                    nome_responsavel, percentagem_preenchido, tempo_realizacao
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id_inquerito
             """, (
-                base_ids["inquerito"] + idx,
-                int(row['id_entidade']) if pd.notna(row['id_entidade']) else None,
+                int(float(row['id_entidade'])) if pd.notna(row['id_entidade']) else None,
                 int(row['ano']) if pd.notna(row['ano']) else None,
-                row['data_submissao'].strftime("%Y-%m-%d") if pd.notna(row['data_submissao']) else None,
+                row['data_submissao'].strftime("%Y-%m-%d") if pd.notna(row['data_submissao']) and hasattr(row['data_submissao'], 'strftime') else None,
                 row['existe_responsavel'] if pd.notna(row['existe_responsavel']) else None,
                 row['nome_responsavel'] if pd.notna(row['nome_responsavel']) else None,
                 int(row['percentagem_preenchido']) if pd.notna(row['percentagem_preenchido']) else None,
                 int(row['tempo_realizacao']) if pd.notna(row['tempo_realizacao']) else None
             ))
+            id_inquerito = cur_inq.fetchone()[0]
+            inquerito_ids.append(id_inquerito)
+
 
     # Formations
     df_formacao = group_dfs.get("formacoes")
@@ -473,30 +436,27 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
         formacoes_existentes = set()
         formacao_id_map = {}
 
-        # Buscar todas as formações já existentes com os seus IDs
+        # Buscar formações já existentes
         cur_inq.execute("SELECT id_formacao, nome_formacao FROM formacao")
         for id_f, nome in cur_inq.fetchall():
             nome_norm = normalize_text(nome)
             formacoes_existentes.add(nome_norm)
             formacao_id_map[nome_norm] = id_f
 
-        id_formacao = base_ids["formacao"]
-        resposta_id = base_ids["res_formacao"]
-
         for nome in nomes_formacoes:
             nome_norm = normalize_text(nome)
             if nome_norm not in formacoes_existentes:
-                # Inserir nova formação
                 cur_inq.execute("""
-                    INSERT INTO formacao (id_formacao, nome_formacao, id_formacao_base, id_grupo_formacao)
-                    VALUES (%s, %s, NULL, NULL)
-                """, (id_formacao, nome))
+                    INSERT INTO formacao (nome_formacao, id_formacao_base, id_grupo_formacao)
+                    VALUES (%s, NULL, NULL)
+                    RETURNING id_formacao
+                """, (nome,))
+                id_form = cur_inq.fetchone()[0]
                 formacoes_existentes.add(nome_norm)
-                formacao_id_map[nome_norm] = id_formacao
-                id_formacao += 1
+                formacao_id_map[nome_norm] = id_form
 
         for i, row in df_formacao.iterrows():
-            id_inquerito = base_ids["inquerito"] + i
+            id_inquerito = inquerito_ids[i]
             for j, n_formandos in enumerate(row):
                 if pd.notna(n_formandos) and n_formandos >= 0:
                     nome_formacao = nomes_formacoes[j]
@@ -505,23 +465,37 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
 
                     if id_formacao_uso is not None:
                         cur_inq.execute("""
-                            INSERT INTO resposta_formacao_inquerito (id_resposta_formacao_inquerito, n_formandos, id_inquerito, id_formacao)
-                            VALUES (%s, %s, %s, %s)
-                        """, (resposta_id, int(n_formandos), id_inquerito, id_formacao_uso))
-                        resposta_id += 1
+                            INSERT INTO resposta_formacao_inquerito (n_formandos, id_inquerito, id_formacao)
+                            VALUES (%s, %s, %s)
+                        """, (int(n_formandos), id_inquerito, id_formacao_uso))
                     else:
                         print(f"⚠️ Formação '{nome_formacao}' não encontrada no mapa.")
 
-    # Int
+
+    # import spacy
+    # nlp = spacy.load("pt_core_news_sm")
+
+    # def split_coments(texto):
+    #     if not isinstance(texto, str) or not texto.strip():
+    #         return []
+    #     doc = nlp(texto.strip())
+    #     return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+
+    import re
+
+    def split_coments(texto):
+        if not isinstance(texto, str) or not texto.strip():
+            return []
+        
+        frases = re.split(r'(?<=[.!?;/|])\s+|,\s+(?=[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ])', texto.strip())
+    
+        return [frase.strip() for frase in frases if frase.strip()]
+
     df_interesses = group_dfs.get("interesses")
     df_comentarios = group_dfs.get("comentarios_interesse")
 
-    print(f"\n\ndf_interesses -> {len(df_interesses.columns)}")
-    print(f"df_comentarios -> {len(df_comentarios.columns)}\n\n")
-
     if df_interesses is not None and not df_interesses.empty:
         df_interesses = df_interesses.reset_index(drop=True)
-
         if df_comentarios is not None and not df_comentarios.empty:
             df_comentarios = df_comentarios.reset_index(drop=True)
 
@@ -529,19 +503,24 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
         df_comentarios.columns = df_comentarios.columns.str.strip().str.replace('\n', ' ')
 
         colunas_interesse = list(df_interesses.columns)
+        id_interesse_map = {}
 
         for idx, nome in enumerate(colunas_interesse):
             cur_inq.execute("""
-                INSERT INTO area_tematica (id_interesse, nome_area)
-                VALUES (%s, %s)
-            """, (base_ids["area"] + idx, nome))
-
-        resposta_id = base_ids["res_area"]
-        comentario_id = base_ids["comentario"]
+                INSERT INTO area_tematica (nome_area)
+                VALUES (%s)
+                ON CONFLICT (nome_area) DO NOTHING
+                RETURNING id_interesse
+            """, (nome,))
+            result = cur_inq.fetchone()
+            if result:
+                id_interesse_map[nome] = result[0]
+            else:
+                cur_inq.execute("SELECT id_interesse FROM area_tematica WHERE nome_area = %s", (nome,))
+                id_interesse_map[nome] = cur_inq.fetchone()[0]
 
         for i, row in df_interesses.iterrows():
-            id_inquerito = base_ids["inquerito"] + i
-
+            id_inquerito = inquerito_ids[i]
             for j, col in enumerate(colunas_interesse):
                 tem_interesse = row[col]
 
@@ -551,82 +530,87 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
                         if valor > 0:
                             n_formandos = int(valor)
 
-                            # Verifica se há um comentário correspondente
                             comentario_col = f"{col}[comentario]"
                             texto = None
                             if df_comentarios is not None and comentario_col in df_comentarios.columns:
                                 texto_raw = df_comentarios.at[i, comentario_col]
                                 if pd.notna(texto_raw):
                                     if isinstance(texto_raw, (int, float)):
-                                        n_formandos = int(texto_raw)  # substitui valor
+                                        n_formandos = int(texto_raw)
                                     elif isinstance(texto_raw, str):
                                         texto_str = texto_raw.strip()
                                         if texto_str.replace(".", "", 1).isdigit():
                                             n_formandos = int(float(texto_str))
                                         elif texto_str:
-                                            texto = texto_str  # comentário textual
+                                            texto = texto_str
 
+                            id_interesse = id_interesse_map[col]
 
-                            # Inserir resposta
                             cur_inq.execute("""
                                 INSERT INTO resposta_interesse_area_inquerito (
-                                    id_resposta_interesse_area_inquerito, tem_interesse, n_formandos, id_inquerito, id_interesse
-                                ) VALUES (%s, %s, %s, %s, %s)
-                            """, (
-                                resposta_id, 1, n_formandos,
-                                id_inquerito, base_ids["area"] + j
-                            ))
+                                    tem_interesse, n_formandos, id_inquerito, id_interesse
+                                ) VALUES (%s, %s, %s, %s)
+                                RETURNING id_resposta_interesse_area_inquerito
+                            """, (1, n_formandos, id_inquerito, id_interesse))
 
-                            # Se houver comentário textual, insere
+                            resposta_id = cur_inq.fetchone()[0]
+
                             if texto:
-                                cur_inq.execute("""
-                                    INSERT INTO comentario (
-                                        id_comentario, id_resposta_interesse_area_inquerito, texto_comentario
-                                    ) VALUES (%s, %s, %s)
-                                """, (comentario_id, resposta_id, texto))
-                                comentario_id += 1
-
-                            resposta_id += 1
+                                for c in split_coments(texto):
+                                    cur_inq.execute("""
+                                        INSERT INTO comentario (
+                                            id_resposta_interesse_area_inquerito, texto_comentario
+                                        ) VALUES (%s, %s)
+                                    """, (resposta_id, c))
                     except ValueError:
                         pass
-
-    # Atualizar base_ids no final (opcional)
-    base_ids["res_area"] = resposta_id
-    base_ids["comentario"] = comentario_id
-
 
     df_pref = group_dfs.get("tipo de ensino")
     if df_pref is not None:
         colunas_pref = df_pref.columns
-        for idx, nome in enumerate(colunas_pref):
-            cur_inq.execute("""
-                INSERT INTO preferencia_ensino (id_preferencia, descricao_preferencia)
-                VALUES (%s, %s)
-            """, (base_ids["pref"] + idx, nome))
+        id_preferencia_map = {}
 
-        resposta_id = base_ids["res_pref"]
+        for nome in colunas_pref:
+            cur_inq.execute("""
+                INSERT INTO preferencia_ensino (descricao_preferencia)
+                VALUES (%s)
+                ON CONFLICT (descricao_preferencia) DO NOTHING
+                RETURNING id_preferencia
+            """, (nome,))
+            result = cur_inq.fetchone()
+            if result:
+                id_preferencia_map[nome] = result[0]
+            else:
+                cur_inq.execute("""
+                    SELECT id_preferencia FROM preferencia_ensino WHERE descricao_preferencia = %s
+                """, (nome,))
+                id_preferencia_map[nome] = cur_inq.fetchone()[0]
+
         for i, row in df_pref.iterrows():
-            id_inquerito = base_ids["inquerito"] + i
-            for j, col in enumerate(colunas_pref):
+            id_inquerito = inquerito_ids[i]
+            for col in colunas_pref:
                 valor = row[col]
                 if pd.notna(valor):
+                    id_preferencia = id_preferencia_map[col]
                     cur_inq.execute("""
-                        INSERT INTO resposta_preferencia_ensino_inquerito (id_resposta_preferencia_ensino_inquerito, valor_preferencia, id_inquerito, id_preferencia)
-                        VALUES (%s, %s, %s, %s)
-                    """, (resposta_id, int(valor), id_inquerito, base_ids["pref"] + j))
-                    resposta_id += 1
+                        INSERT INTO resposta_preferencia_ensino_inquerito (
+                            valor_preferencia, id_inquerito, id_preferencia
+                        )
+                        VALUES (%s, %s, %s)
+                    """, (int(valor), id_inquerito, id_preferencia))
 
-    # 1. Obter mapeamento dos tipos
+   # 1. Obter mapeamento dos tipos
     cur_inq.execute("SELECT id_tipo_disp, descricao_tipo_disp FROM tipos_disponibilidades")
     tipos_disp = cur_inq.fetchall()
     map_tipos = {desc.strip(): id_ for id_, desc in tipos_disp}
 
-   # 2. Gerar df_disp
+    # 2. Gerar df_disp
     df_disp = group_dfs.get("disponibilidade")
     if df_disp is not None:
         colunas_disp = df_disp.columns
+        id_horario_map = {}
 
-        for idx, nome in enumerate(colunas_disp):
+        for nome in colunas_disp:
             nome_norm = normalize_text(nome)
             id_tipo = None
 
@@ -638,60 +622,40 @@ def load_data_to_bd(group_dfs: dict[str, pd.DataFrame]):
 
             descricao = extract_content_in_brackets(nome)
 
-            id_horario_map = {}
+            cur_inq.execute("""
+                SELECT id_horario FROM disponibilidade_horaria
+                WHERE descricao_horario = %s AND id_tipo_disp = %s
+            """, (descricao, id_tipo))
 
-            for idx, nome in enumerate(colunas_disp):
-                nome_norm = normalize_text(nome)
-                id_tipo = None
-
-                for tipo_prefixo, id_ in map_tipos.items():
-                    tipo_norm = normalize_text(f"{tipo_prefixo} -")
-                    if nome_norm.startswith(tipo_norm):
-                        id_tipo = id_
-                        break
-
-                descricao = extract_content_in_brackets(nome)
-
-                # Verificar se já existe e obter id_horario
+            result = cur_inq.fetchone()
+            if result:
+                id_horario = result[0]
+            else:
                 cur_inq.execute("""
-                    SELECT id_horario FROM disponibilidade_horaria
-                    WHERE descricao_horario = %s AND id_tipo_disp = %s
+                    INSERT INTO disponibilidade_horaria (descricao_horario, id_tipo_disp)
+                    VALUES (%s, %s)
+                    RETURNING id_horario
                 """, (descricao, id_tipo))
+                id_horario = cur_inq.fetchone()[0]
 
-                result = cur_inq.fetchone()
-
-                if result:
-                    id_horario = result[0]
-                else:
-                    id_horario = base_ids["disp"] + idx
-                    cur_inq.execute("""
-                        INSERT INTO disponibilidade_horaria (id_horario, descricao_horario, id_tipo_disp)
-                        VALUES (%s, %s, %s)
-                    """, (id_horario, descricao, id_tipo))
-
-                # Guardar mapeamento
-                id_horario_map[nome] = id_horario
+            id_horario_map[nome] = id_horario
 
         # Inserir respostas
-        resposta_id = base_ids["res_disp"]
         for i, row in df_disp.iterrows():
-            id_inquerito = base_ids["inquerito"] + i
-            for j, col in enumerate(colunas_disp):
+            id_inquerito = inquerito_ids[i]
+            for col in colunas_disp:
                 tem_disp = row[col]
                 if pd.notna(tem_disp):
                     id_horario = id_horario_map.get(col)
                     if id_horario is not None:
                         cur_inq.execute("""
                             INSERT INTO resposta_disponibilidade_horaria_inquerito (
-                                id_resposta_disponibilidade_horaria_inquerito,
                                 tem_disponibilidade,
                                 id_inquerito,
                                 id_horario
                             )
-                            VALUES (%s, %s, %s, %s)
-                        """, (resposta_id, int(tem_disp), id_inquerito, id_horario))
-                        resposta_id += 1
-
+                            VALUES (%s, %s, %s)
+                        """, (int(tem_disp), id_inquerito, id_horario))
 
     conn_inq.commit()
     cur_inq.close()
